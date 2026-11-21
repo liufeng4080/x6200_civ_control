@@ -525,12 +525,28 @@ class FT8TimingTests(unittest.TestCase):
     def test_late_ptt_aborts_ft8_and_turns_off(self):
         events = []
         clock = FakeClock()
-        session = self.make_session(events, clock)
+        # 迟到 3.5 秒 > PTT_LATE_TOLERANCE_NS=3 秒 → 中止并安全关 PTT。
+        session = self.make_session(events, clock, ptt_delay=4.5)
         sender = self.make_sender(events, clock)
         with mock.patch.object(x6200, "AudioSender", return_value=sender), \
                 self.assertRaisesRegex(x6200.ProtocolTimeout, "晚于 FT8 时隙"):
             session.transmit(b"\x01\x02", start_ns=1_000_000_000)
         self.assertEqual(events, ["ptt_on", "ptt_off"])
+
+    def test_late_ptt_within_tolerance_transmits(self):
+        events = []
+        clock = FakeClock()
+        # 迟到 0.5 秒 < PTT_LATE_TOLERANCE_NS=3 秒 → 不中止，从确认时刻起发射。
+        session = self.make_session(events, clock, ptt_delay=1.5)
+        sender = self.make_sender(events, clock)
+        with mock.patch.object(x6200, "AudioSender", return_value=sender):
+            session.transmit(b"\x01\x02", start_ns=1_000_000_000)
+        # FT8_PTT_LEAD_NS=1s → ptt_at=0；set_ptt 推进 1.5s → 确认在 1.5s，迟到 0.5s。
+        self.assertEqual(events, [
+            "ptt_on",
+            ("ft8", 1_500_000_000, 1_500_000_000 + x6200.AUDIO_SEND_AHEAD_NS),
+            "ptt_off",
+        ])
 
 
 class TransmitCleanupTests(unittest.TestCase):

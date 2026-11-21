@@ -36,8 +36,12 @@ MAX_AUDIO_LATENESS_NS = 100_000_000
 FT8_SLOT_PERIOD_NS = 15_000_000_000
 # 时隙选择余量：握手后至少留 8 秒，用于静音预填充与 PTT 两次尝试。
 FT8_START_LEAD_NS = 8_000_000_000
-# PTT 请求提前量：CI-V ACK 与 TX 状态回读实测抖动 0.01~3 秒，留 4 秒吸收。
-FT8_PTT_LEAD_NS = 4_000_000_000
+# PTT 请求提前量：CI-V ACK 与 TX 状态回读实测抖动 0.01~3 秒。
+# 实验值 1 秒（原 4 秒）。本电台 PTT→TX 确认约需 3 秒，1 秒提前量下确认常迟到；
+# 迟到是否仍发射由 PTT_LATE_TOLERANCE_NS 决定，超过容忍才安全关 PTT、不发残缺突发。
+FT8_PTT_LEAD_NS = 1_000_000_000
+# PTT/TX 确认迟到容忍：确认时刻晚于时隙起点不超过该值则仍发射（DT 相应偏移），超过则中止。
+PTT_LATE_TOLERANCE_NS = 3_000_000_000
 TRACKED_CACHE_SIZE = 500  # 与 wfview BUFSIZE 一致，可缓存 6.25 秒网络音频。
 MAX_DATAGRAM = 65535
 
@@ -899,7 +903,7 @@ class X6200Session:
             sender.next_ns = self.clock() + AUDIO_SEND_AHEAD_NS
             if start_ns is not None:
                 # 时隙前持续输出静音，避免电台音频通道因长时间无包而失联；
-                # PTT 在时隙前 1.5 秒请求，确认后再按时隙边界发送符号。
+                # PTT 在时隙前 FT8_PTT_LEAD_NS 秒请求，确认后再按时隙边界发送符号。
                 tx_deadline = start_ns + int(max_tx_seconds * 1_000_000_000)
                 ptt_at = start_ns - FT8_PTT_LEAD_NS
                 while self.clock() < ptt_at:
@@ -911,15 +915,30 @@ class X6200Session:
                     drain_civ=False, limit_ns=tx_deadline))
                 self.tx_monitor = True
                 self.next_tx_query_ns = 0
-                if self.clock() > start_ns + AUDIO_TICK_PERIOD_NS:
-                    raise ProtocolTimeout("PTT 确认晚于 FT8 时隙起点，中止本次发射")
-                while self.clock() < start_ns - AUDIO_SEND_AHEAD_NS:
-                    self.service_background(drain_civ=False)
-                    sender.pump_silence(drain_civ=False, limit_ns=tx_deadline)
-                    remaining = start_ns - AUDIO_SEND_AHEAD_NS - self.clock()
-                    self.sleeper(min(POLL_INTERVAL, max(0, remaining) / 1_000_000_000))
-                sender.next_ns = start_ns
-                LOG.info("FT8 UTC 时隙开始，发送 79 个符号")
+                lateness_ns = self.clock() - start_ns
+                if lateness_ns > PTT_LATE_TOLERANCE_NS:
+                    raise ProtocolTimeout(
+                        "PTT 确认晚于 FT8 时隙起点 %.3f 秒（容忍 %.1f 秒），中止本次发射" % (
+                            lateness_ns / 1_000_000_000,
+                            PTT_LATE_TOLERANCE_NS / 1_000_000_000))
+                if lateness_ns <= 0:
+                    # 提前或准时：泵送静音至时隙边界，符号对齐时隙起点。
+                    while self.clock() < start_ns - AUDIO_SEND_AHEAD_NS:
+                        self.service_background(drain_civ=False)
+                        sender.pump_silence(drain_civ=False, limit_ns=tx_deadline)
+                        remaining = start_ns - AUDIO_SEND_AHEAD_NS - self.clock()
+                        self.sleeper(min(POLL_INTERVAL, max(0, remaining) / 1_000_000_000))
+                    sender.next_ns = start_ns
+                    LOG.info("FT8 UTC 时隙开始，发送 79 个符号")
+                else:
+                    # 迟到但在容忍内：从确认时刻起正常节奏发送，DT 偏移约等于迟到量。
+                    sender.next_ns = self.clock() + AUDIO_SEND_AHEAD_NS
+                    LOG.warning(
+                        "PTT 确认晚于时隙 %.3f 秒（容忍 %.1f 秒），立即开始发射，DT 将偏移约 %.3f 秒",
+                        lateness_ns / 1_000_000_000, PTT_LATE_TOLERANCE_NS / 1_000_000_000,
+                        lateness_ns / 1_000_000_000)
+                    LOG.info("FT8 符号开始（相对时隙 %.3f s），发送 79 个符号",
+                             lateness_ns / 1_000_000_000)
             else:
                 ptt_attempted = True
                 # 先请求 PTT 并确认，确认期间不发送音频，避免音频突发挤占 CI-V ACK。
