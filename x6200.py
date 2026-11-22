@@ -36,12 +36,12 @@ MAX_AUDIO_LATENESS_NS = 100_000_000
 FT8_SLOT_PERIOD_NS = 15_000_000_000
 # 时隙选择余量：握手后至少留 8 秒，用于静音预填充与 PTT 两次尝试。
 FT8_START_LEAD_NS = 8_000_000_000
-# PTT 请求提前量：CI-V ACK 与 TX 状态回读实测抖动 0.01~3 秒。
-# 实验值 1 秒（原 4 秒）。本电台 PTT→TX 确认约需 3 秒，1 秒提前量下确认常迟到；
-# 迟到是否仍发射由 PTT_LATE_TOLERANCE_NS 决定，超过容忍才安全关 PTT、不发残缺突发。
-FT8_PTT_LEAD_NS = 1_000_000_000
-# PTT/TX 确认迟到容忍：确认时刻晚于时隙起点不超过该值则仍发射（DT 相应偏移），超过则中止。
-PTT_LATE_TOLERANCE_NS = 3_000_000_000
+# FT8 时隙起点立即请求 PTT（不提前）。实测：电台收到 PTT 立即执行（进入 TX），
+# 仅 CI-V ACK 回得慢（约 2 秒，wfview 亦同），且 PTT 从未不执行。
+# 因此不提前 PTT、也不等 ACK，符号从时隙起点对齐发射（DT≈0），不侵入前一时隙。
+FT8_PTT_LEAD_NS = 0
+# PTT 生效看门狗：PTT ON 后超过该时长仍未收到 ACK 或 TX 状态确认，则停止发射（安全网）。
+PTT_ACK_WATCHDOG_NS = 4_000_000_000
 TRACKED_CACHE_SIZE = 500  # 与 wfview BUFSIZE 一致，可缓存 6.25 秒网络音频。
 MAX_DATAGRAM = 65535
 
@@ -425,6 +425,9 @@ class X6200Session:
         self.last_ptt_state = None
         self.tx_monitor = False
         self.next_tx_query_ns = 0
+        self.ptt_watchdog_ns = None
+        self.ptt_retry_ns = None
+        self.ptt_ack_seen = False
         self.rx_audio_packets = 0
         self.next_civ_open = 0
         self.next_civ_idle = 0
@@ -650,6 +653,9 @@ class X6200Session:
                 self.last_ptt_state = frame[6]
                 LOG.info("CI-V PTT 状态回读：%s",
                          "TX" if frame[6] else "RX")
+            elif (len(frame) == 6 and frame[2] == CONTROLLER_CIV and
+                    frame[3] == self.radio_civ and frame[4] == 0xFB):
+                self.ptt_ack_seen = True
         return frames
 
     def drain_civ(self):
@@ -704,7 +710,10 @@ class X6200Session:
         self.keepalive()
         self.drain_control()
         self.drain_audio()
-        if self.tx_monitor:
+        # PTT ON 未确认期间只接收 CI-V，不发送状态查询，避免查询抢占 PTT 应答。
+        if self.ptt_watchdog_ns is not None:
+            drain_civ = True
+        if self.tx_monitor and self.ptt_watchdog_ns is None:
             now = self.clock()
             if now >= self.next_tx_query_ns:
                 self.send_civ_frame(build_civ_frame(self.radio_civ, b"\x1C\x00"))
@@ -713,6 +722,24 @@ class X6200Session:
                 drain_civ = True
         if drain_civ:
             self.drain_civ()
+        # PTT 生效看门狗：收到 ACK 或 TX 回读即解除；超时未确认则中止发射。
+        if self.ptt_watchdog_ns is not None:
+            if self.ptt_ack_seen or self.last_ptt_state == 1:
+                LOG.info("PTT 生效确认（ACK=%s，TX回读=%s），看门狗解除",
+                         self.ptt_ack_seen, self.last_ptt_state == 1)
+                self.ptt_watchdog_ns = None
+                self.ptt_retry_ns = None
+                self.tx_monitor = True
+                self.next_tx_query_ns = 0
+            elif self.clock() >= self.ptt_watchdog_ns:
+                self.ptt_watchdog_ns = None
+                self.ptt_retry_ns = None
+                raise PTTError("PTT ON 后 4 秒内未收到 ACK 或 TX 确认，停止发射")
+            elif self.ptt_retry_ns is not None and self.clock() >= self.ptt_retry_ns:
+                LOG.warning("PTT ON 未确认，后台补发一次（不阻塞音频）")
+                self.send_civ_frame(build_civ_frame(
+                    self.radio_civ, b"\x1C\x00\x01"))
+                self.ptt_retry_ns = None
 
     def open_civ_channel(self):
         self.civ_opened = True
@@ -824,6 +851,20 @@ class X6200Session:
         self.next_audio_ping = self.clock()
         LOG.info("网络音频 AYT/Here/Ready 握手完成")
 
+    def ptt_on_fire(self):
+        # 发 PTT ON 但不等 ACK（电台实测立即执行 PTT，仅 ACK 回得慢，且从未不执行）。
+        # 启动 4 秒看门狗：期间收到 ACK 或 TX 回读即确认，否则由 service_background 中止发射。
+        command = build_civ_frame(self.radio_civ, b"\x1C\x00\x01")
+        self.drain_civ()
+        self.last_ptt_state = None
+        self.ptt_ack_seen = False
+        LOG.info("PTT ON 发送（不等 ACK）：%s", command.hex(" "))
+        self.send_civ_frame(command)
+        self.tx_monitor = False
+        self.next_tx_query_ns = 0
+        self.ptt_retry_ns = self.clock() + int(CIV_ACK_TIMEOUT * 1_000_000_000)
+        self.ptt_watchdog_ns = self.clock() + PTT_ACK_WATCHDOG_NS
+
     def set_ptt(self, transmit, wait_callback=None):
         target = 1 if transmit else 0
         label = "ON" if transmit else "OFF"
@@ -902,43 +943,23 @@ class X6200Session:
             tx_deadline = self.clock() + int(max_tx_seconds * 1_000_000_000)
             sender.next_ns = self.clock() + AUDIO_SEND_AHEAD_NS
             if start_ns is not None:
-                # 时隙前持续输出静音，避免电台音频通道因长时间无包而失联；
-                # PTT 在时隙前 FT8_PTT_LEAD_NS 秒请求，确认后再按时隙边界发送符号。
+                # 时隙前持续输出静音，避免电台音频通道因长时间无包而失联。
+                # 时隙起点立即请求 PTT（不提前），不等 ACK 即对齐时隙发射符号。
                 tx_deadline = start_ns + int(max_tx_seconds * 1_000_000_000)
                 ptt_at = start_ns - FT8_PTT_LEAD_NS
-                while self.clock() < ptt_at:
+                # 泵静音至时隙边界，保持音频通道活跃。
+                while self.clock() < ptt_at - AUDIO_SEND_AHEAD_NS:
                     self.service_background(drain_civ=False)
                     sender.pump_silence(drain_civ=False, limit_ns=tx_deadline)
-                    self.sleeper(POLL_INTERVAL)
+                    remaining = ptt_at - AUDIO_SEND_AHEAD_NS - self.clock()
+                    self.sleeper(min(POLL_INTERVAL, max(0, remaining) / 1_000_000_000))
                 ptt_attempted = True
-                self.set_ptt(True, wait_callback=lambda: sender.pump_silence(
-                    drain_civ=False, limit_ns=tx_deadline))
-                self.tx_monitor = True
-                self.next_tx_query_ns = 0
-                lateness_ns = self.clock() - start_ns
-                if lateness_ns > PTT_LATE_TOLERANCE_NS:
-                    raise ProtocolTimeout(
-                        "PTT 确认晚于 FT8 时隙起点 %.3f 秒（容忍 %.1f 秒），中止本次发射" % (
-                            lateness_ns / 1_000_000_000,
-                            PTT_LATE_TOLERANCE_NS / 1_000_000_000))
-                if lateness_ns <= 0:
-                    # 提前或准时：泵送静音至时隙边界，符号对齐时隙起点。
-                    while self.clock() < start_ns - AUDIO_SEND_AHEAD_NS:
-                        self.service_background(drain_civ=False)
-                        sender.pump_silence(drain_civ=False, limit_ns=tx_deadline)
-                        remaining = start_ns - AUDIO_SEND_AHEAD_NS - self.clock()
-                        self.sleeper(min(POLL_INTERVAL, max(0, remaining) / 1_000_000_000))
-                    sender.next_ns = start_ns
-                    LOG.info("FT8 UTC 时隙开始，发送 79 个符号")
-                else:
-                    # 迟到但在容忍内：从确认时刻起正常节奏发送，DT 偏移约等于迟到量。
-                    sender.next_ns = self.clock() + AUDIO_SEND_AHEAD_NS
-                    LOG.warning(
-                        "PTT 确认晚于时隙 %.3f 秒（容忍 %.1f 秒），立即开始发射，DT 将偏移约 %.3f 秒",
-                        lateness_ns / 1_000_000_000, PTT_LATE_TOLERANCE_NS / 1_000_000_000,
-                        lateness_ns / 1_000_000_000)
-                    LOG.info("FT8 符号开始（相对时隙 %.3f s），发送 79 个符号",
-                             lateness_ns / 1_000_000_000)
+                # 时隙起点立即 PTT（不等 ACK）：电台实测立即执行，仅 ACK 回得慢。
+                self.ptt_on_fire()
+                # 不等 ACK/TX 确认，符号直接从时隙起点对齐发射（DT≈0）；
+                # 4 秒看门狗在后台确认 PTT 生效，未生效则中止。
+                sender.next_ns = start_ns
+                LOG.info("FT8 UTC 时隙开始：立即 PTT 并发送 79 个符号（不等 ACK，4 秒看门狗）")
             else:
                 ptt_attempted = True
                 # 先请求 PTT 并确认，确认期间不发送音频，避免音频突发挤占 CI-V ACK。
@@ -962,6 +983,8 @@ class X6200Session:
             raise
         finally:
             self.tx_monitor = False
+            self.ptt_watchdog_ns = None
+            self.ptt_retry_ns = None
             if ptt_attempted and not off_confirmed:
                 cleanup_errors = []
                 for attempt in range(3):

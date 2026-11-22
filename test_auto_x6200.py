@@ -468,6 +468,82 @@ class CIVSafetyTests(unittest.TestCase):
         with self.assertRaises(x6200.PTTError):
             session.set_ptt(True)
 
+    def make_watchdog_session(self):
+        session = self.make_session()
+        session.keepalive = mock.Mock()
+        session.drain_control = mock.Mock()
+        session.drain_audio = mock.Mock()
+        session.tx_monitor = False
+        session.ptt_ack_seen = False
+        session.last_ptt_state = None
+        session.ptt_watchdog_ns = None
+        session.ptt_retry_ns = None
+        session.next_tx_query_ns = 0
+        return session
+
+    def test_ptt_on_fire_sends_on_and_arms_watchdog(self):
+        session = self.make_session()
+        session.ptt_ack_seen = True
+        session.last_ptt_state = 1
+        session.ptt_watchdog_ns = None
+        session.tx_monitor = True
+        session.ptt_on_fire()
+        session.send_civ_frame.assert_called_once_with(
+            x6200.build_civ_frame(0xA4, b"\x1C\x00\x01"))
+        session.drain_civ.assert_called_once_with()
+        self.assertFalse(session.ptt_ack_seen)
+        self.assertIsNone(session.last_ptt_state)
+        self.assertEqual(session.ptt_watchdog_ns,
+                         session.clock() + x6200.PTT_ACK_WATCHDOG_NS)
+        self.assertEqual(session.ptt_retry_ns,
+                         session.clock() + int(x6200.CIV_ACK_TIMEOUT * 1_000_000_000))
+        self.assertFalse(session.tx_monitor)
+
+    def test_ptt_watchdog_disarms_on_ack_or_tx_readback(self):
+        for confirm in ("ack", "tx"):
+            with self.subTest(confirm=confirm):
+                session = self.make_watchdog_session()
+                session.ptt_watchdog_ns = (
+                    session.clock() + x6200.PTT_ACK_WATCHDOG_NS)
+                if confirm == "ack":
+                    session.ptt_ack_seen = True
+                else:
+                    session.last_ptt_state = 1
+                session.service_background()
+                self.assertIsNone(session.ptt_watchdog_ns)
+                self.assertIsNone(session.ptt_retry_ns)
+                self.assertTrue(session.tx_monitor)
+
+    def test_ptt_watchdog_pending_before_timeout(self):
+        session = self.make_watchdog_session()
+        session.ptt_watchdog_ns = session.clock() + x6200.PTT_ACK_WATCHDOG_NS
+        session.service_background()
+        self.assertIsNotNone(session.ptt_watchdog_ns)
+
+    def test_ptt_watchdog_retries_without_tx_query_or_blocking(self):
+        session = self.make_watchdog_session()
+        session.tx_monitor = True
+        session.ptt_watchdog_ns = session.clock() + x6200.PTT_ACK_WATCHDOG_NS
+        session.ptt_retry_ns = session.clock() + int(
+            x6200.CIV_ACK_TIMEOUT * 1_000_000_000)
+        session.service_background()
+        session.send_civ_frame.assert_not_called()
+        session.clock.sleep(2)
+        session.service_background()
+        session.send_civ_frame.assert_called_once_with(
+            x6200.build_civ_frame(0xA4, b"\x1C\x00\x01"))
+        self.assertIsNone(session.ptt_retry_ns)
+        self.assertIsNotNone(session.ptt_watchdog_ns)
+
+    def test_ptt_watchdog_timeout_raises(self):
+        session = self.make_watchdog_session()
+        session.ptt_watchdog_ns = session.clock() + x6200.PTT_ACK_WATCHDOG_NS
+        session.clock.sleep(5)
+        with self.assertRaisesRegex(x6200.PTTError, "4 秒"):
+            session.service_background()
+        self.assertIsNone(session.ptt_watchdog_ns)
+        self.assertIsNone(session.ptt_retry_ns)
+
 
 class FT8TimingTests(unittest.TestCase):
     def test_slot_skips_when_setup_lead_is_insufficient(self):
@@ -481,18 +557,18 @@ class FT8TimingTests(unittest.TestCase):
         self.assertEqual(wall, 30_000_000_000)
         self.assertEqual(start, 118_999_999_999)
 
-    def make_session(self, events, clock, ptt_delay=1.2):
+    def make_session(self, events, clock):
         session = object.__new__(x6200.X6200Session)
         session.udig_verified = True
         session.audio_opened = True
         session.clock = clock
         session.sleeper = clock.sleep
         session.service_background = mock.Mock()
+        # 新逻辑：时隙起点 ptt_on_fire 立即 PTT（不等 ACK），set_ptt 仅用于 PTT OFF。
+        session.ptt_on_fire = lambda: events.append("ptt_on")
 
         def set_ptt(transmit, wait_callback=None):
             events.append("ptt_on" if transmit else "ptt_off")
-            if transmit:
-                clock.sleep(ptt_delay)
 
         session.set_ptt = set_ptt
         return session
@@ -510,41 +586,14 @@ class FT8TimingTests(unittest.TestCase):
     def test_ft8_pcm_starts_on_slot_boundary(self):
         events = []
         clock = FakeClock()
-        # PTT 提前量 1.5 秒，模拟 ACK 0.2 秒返回，确认早于时隙边界。
-        session = self.make_session(events, clock, ptt_delay=0.2)
+        session = self.make_session(events, clock)
         sender = self.make_sender(events, clock)
         with mock.patch.object(x6200, "AudioSender", return_value=sender):
             session.transmit(b"\x01\x02", start_ns=4_000_000_000)
-        # 音频提前 AUDIO_SEND_AHEAD_NS 投递，名义时点仍对齐时隙边界。
+        # 时隙起点立即 PTT（不等 ACK），符号名义时点对齐时隙边界。
         self.assertEqual(events, [
             "ptt_on",
             ("ft8", 4_000_000_000 - x6200.AUDIO_SEND_AHEAD_NS, 4_000_000_000),
-            "ptt_off",
-        ])
-
-    def test_late_ptt_aborts_ft8_and_turns_off(self):
-        events = []
-        clock = FakeClock()
-        # 迟到 3.5 秒 > PTT_LATE_TOLERANCE_NS=3 秒 → 中止并安全关 PTT。
-        session = self.make_session(events, clock, ptt_delay=4.5)
-        sender = self.make_sender(events, clock)
-        with mock.patch.object(x6200, "AudioSender", return_value=sender), \
-                self.assertRaisesRegex(x6200.ProtocolTimeout, "晚于 FT8 时隙"):
-            session.transmit(b"\x01\x02", start_ns=1_000_000_000)
-        self.assertEqual(events, ["ptt_on", "ptt_off"])
-
-    def test_late_ptt_within_tolerance_transmits(self):
-        events = []
-        clock = FakeClock()
-        # 迟到 0.5 秒 < PTT_LATE_TOLERANCE_NS=3 秒 → 不中止，从确认时刻起发射。
-        session = self.make_session(events, clock, ptt_delay=1.5)
-        sender = self.make_sender(events, clock)
-        with mock.patch.object(x6200, "AudioSender", return_value=sender):
-            session.transmit(b"\x01\x02", start_ns=1_000_000_000)
-        # FT8_PTT_LEAD_NS=1s → ptt_at=0；set_ptt 推进 1.5s → 确认在 1.5s，迟到 0.5s。
-        self.assertEqual(events, [
-            "ptt_on",
-            ("ft8", 1_500_000_000, 1_500_000_000 + x6200.AUDIO_SEND_AHEAD_NS),
             "ptt_off",
         ])
 

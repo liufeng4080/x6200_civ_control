@@ -59,31 +59,32 @@ Only `CQ BH1WQR OM89` is accepted for FT8; any other text raises `ValueError` by
 | Constant | Value | Purpose |
 | --- | --- | --- |
 | `FT8_START_LEAD_NS` | 8 s | Minimum gap from now to the chosen slot |
-| `FT8_PTT_LEAD_NS` | 1 s | PTT request lead (was 4 s). The radio's PTT→TX confirm takes ~3 s, so confirmation lands ~2 s late; see `PTT_LATE_TOLERANCE_NS` |
-| `PTT_LATE_TOLERANCE_NS` | 3 s | If PTT/TX confirms no more than this late past the slot, transmit anyway (DT shifts by the lateness); beyond it, abort safely. Must exceed the measured ~2.1 s max lateness |
+| `FT8_PTT_LEAD_NS` | 0 s | Request PTT at the slot boundary, not in advance |
+| `PTT_ACK_WATCHDOG_NS` | 4 s | Abort and turn PTT off if neither FB ACK nor TX readback arrives |
+| `CIV_ACK_TIMEOUT` | 2 s | Also schedules one non-blocking FT8 PTT ON retry |
 | `AUDIO_SAMPLES_PER_TICK` | 600 | 12.5 ms per datagram, 1224 bytes on the wire |
 
-- With the 1 s PTT lead the radio confirms TX about 2.05–2.12 s after the slot boundary (PTT request → TX confirm ≈ 3 s: the first CI-V PTT frame routinely times out at 2 s, the retransmit ACKs, then the TX-state readback confirms ~1 s later). `PTT_LATE_TOLERANCE_NS = 3 s` lets the burst start from the confirmation time, so on-air DT is about +2.1 s. Symbols are paced normally from that point — simply time-shifted, not garbled.
-- Do not skip the PTT confirmation and do not fire-and-forget PTT ON: an unconfirmed PTT left the radio in RX for the whole burst (silent transmission).
-- Keep `PTT_LATE_TOLERANCE_NS` above the measured max lateness (~2.12 s here). At 2.0 s every run aborted (lateness 2.05–2.12 s); 2.5–3.0 s transmits reliably at the cost of DT ≈ lateness. Restoring a 4 s lead returns DT to the nominal 0.16–0.30 s and lets you tighten the tolerance.
-- Keep the periodic PTT state readback inside `service_background` (`tx_monitor`, `1C 00`). Removing it reintroduces the 6 second audio stall while the carrier stays keyed.
-- If PTT confirmation arrives later than the slot start by more than `PTT_LATE_TOLERANCE_NS`, the run aborts with `ProtocolTimeout` and turns PTT off. Never send a partial FT8 burst.
+- The FT8 path calls `ptt_on_fire()` at the slot boundary and starts the 79 symbols immediately. Do not move blocking `set_ptt(True)` back into this path: waiting for ACK/readback was what previously shifted DT to about 2.1 s.
+- While PTT confirmation is pending, `service_background()` drains CI-V but does not send periodic TX-state queries. If still unconfirmed after 2 s, it sends one PTT ON retry without pausing audio. ACK or TX readback disarms the watchdog and enables `tx_monitor`.
+- The first PTT ON commonly receives ACK only after the background retry, and TX readback can change from RX to TX later still. These protocol delays do **not** prove that RF started late. The 2026-11-22 on-air test had ACK at about +2.1 s and TX readback at about +3.1 s, yet the receiver measured DT = +0.1 s at −6 dB.
+- Keep the periodic PTT state readback inside `service_background()` after confirmation (`tx_monitor`, `1C 00`). Removing it reintroduces the 6 second audio stall while the carrier stays keyed.
+- If no ACK or TX readback arrives within 4 s, the watchdog raises `PTTError`; the `finally` cleanup sends PTT OFF and requires RX confirmation.
 
 ## Expected log sequence
 
 ```
 FT8 目标时隙：... UTC
-PTT ON 发送：...                     (at slot − 1 s)
-PTT ON ACK 超时，补发一次            (first CI-V PTT frame routinely times out at slot + 1 s)
-PTT ON 已获 FB，电台 TX 状态确认：TX  (at ~slot + 2.1 s)
-PTT 确认晚于时隙 2.1xx 秒（容忍 3.0 秒），立即开始发射，DT 将偏移约 2.1xx 秒
-FT8 符号开始（相对时隙 2.1xx s），发送 79 个符号
-CI-V PTT 状态回读：TX                (repeats about once per second)
+PTT ON 发送（不等 ACK）：...
+FT8 UTC 时隙开始：立即 PTT 并发送 79 个符号（不等 ACK，4 秒看门狗）
+PTT ON 未确认，后台补发一次（不阻塞音频）  (at about slot + 2 s; absent if the first ACK arrives)
+PTT 生效确认（ACK=True，TX回读=False），看门狗解除
+CI-V PTT 状态回读：RX                     (a transitional readback is possible)
+CI-V PTT 状态回读：TX                     (repeats about once per second)
 PTT OFF 已获 FB，电台 TX 状态确认：RX
 网络音频发送完成：packets=... late=... skipped=0 errors=0
 ```
 
-If PTT confirms before the slot (early/on-time with a larger lead), the warning line is absent and the log reads `FT8 UTC 时隙开始，发送 79 个符号` instead.
+Do not infer DT from the ACK or TX-readback timestamps. Confirm DT at the receiver.
 
 Success requires `skipped=0`, `errors=0`, and a final RX confirmation.
 
@@ -92,7 +93,7 @@ Success requires `skipped=0`, `errors=0`, and a final RX confirmation.
 Network completion is not success. Ask the operator to confirm decode on WSJT-X or a second receiver:
 
 - Message decoded as `CQ BH1WQR OM89`
-- DT about +2.1 s is nominal with the 1 s lead + 3 s tolerance (the burst is time-shifted late). A 4 s lead gives 0.16–0.30 s
+- The verified slot-start PTT configuration measured DT = +0.1 s and −6 dB on 2026-11-22
 - Audible burst about 12.6 s long, not truncated to about 6 s
 
 ## Troubleshooting
@@ -102,7 +103,8 @@ Network completion is not success. Ask the operator to confirm decode on WSJT-X 
 | Audio stops after about 6 s, PTT stays TX | Missing periodic PTT readback, or radio USB power management re-enabled | Keep `tx_monitor`, re-apply preflight step 3 |
 | PTT never acknowledged, status stays RX | Post-reboot zombie session (`conninfo` shows `busy=1`) | Power-cycle the radio, then retry |
 | Many retransmit requests during TX | Wi-Fi link degraded | Re-run preflight steps 3 and 4 |
-| DT about 2 s with 1 s lead | Expected: PTT→TX confirm is ~2.1 s late | Normal for this config; reduce lateness by increasing `FT8_PTT_LEAD_NS`, or restore the 4 s lead for nominal DT |
+| DT about 2 s | The FT8 path regressed to blocking PTT confirmation or an old mirror is running | Confirm FT8 uses `ptt_on_fire()` with zero lead; do not add a pre-slot PTT delay |
+| ACK arrives only after the 2 s retry but received DT is about 0.1 s | Observed normal radio behavior; protocol confirmation is delayed, RF is not | No action; keep the background retry and 4 s watchdog |
 | `U-DIG 回读为 01/00/01` right after `CI-V open` | First `26 00 01 01 01` frame is dropped on a freshly opened CI-V channel, especially after a reflash | Nothing to do: `set_udig` retries up to 3 times with a 0.3 s gap and still refuses PTT unless it reads back `01/01/01` |
 | Radio still keyed after an error | CI-V lost during the run | Reconnect once and send PTT OFF, then confirm RX |
 
@@ -113,4 +115,4 @@ cd /home/liufeng/Documents/trae_projects/auto_x6200
 python3 -m unittest
 ```
 
-All 36 tests must pass before and after any timing change.
+All 40 tests must pass before and after any timing change.
